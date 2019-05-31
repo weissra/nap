@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
+	"github.com/tevino/abool"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -13,8 +15,26 @@ import (
 // forming a single master multiple slaves topology.
 // Reads and writes are automatically directed to the correct physical db.
 type DB struct {
-	pdbs  []*sql.DB // Physical databases
-	count uint64    // Monotonically incrementing counter on each query
+	pdbs          []*HealthyDB // Physical databases
+	count         uint64       // Monotonically incrementing counter on each query
+	overallHealth *abool.AtomicBool
+}
+
+type HealthyDB struct {
+	DB      *sql.DB
+	healthy *abool.AtomicBool
+}
+
+func (hDB HealthyDB) IsHealthy() bool {
+	return hDB.healthy.IsSet()
+}
+
+func (hDB HealthyDB) SetUnhealthy() {
+	hDB.healthy.SetTo(false)
+}
+
+func (hDB HealthyDB) SetHealthy() {
+	hDB.healthy.SetToIf(false, true)
 }
 
 // Open concurrently opens each underlying physical db.
@@ -22,16 +42,20 @@ type DB struct {
 // one being used as the master and the rest as slaves.
 func Open(driverName, dataSourceNames string) (*DB, error) {
 	conns := strings.Split(dataSourceNames, ";")
-	db := &DB{pdbs: make([]*sql.DB, len(conns))}
+	db := &DB{pdbs: make([]*HealthyDB, len(conns)), overallHealth: abool.NewBool(false)}
 
 	err := scatter(len(db.pdbs), func(i int) (err error) {
-		db.pdbs[i], err = sql.Open(driverName, conns[i])
+		db.pdbs[i] = &HealthyDB{}
+		if db.pdbs[i].DB, err = sql.Open(driverName, conns[i]); err == nil {
+			db.pdbs[i].healthy = abool.NewBool(true)
+		}
 		return err
 	})
 
 	if err != nil {
 		return nil, err
 	}
+	db.overallHealth.SetTo(true)
 
 	return db, nil
 }
@@ -39,7 +63,7 @@ func Open(driverName, dataSourceNames string) (*DB, error) {
 // Close closes all physical databases concurrently, releasing any open resources.
 func (db *DB) Close() error {
 	return scatter(len(db.pdbs), func(i int) error {
-		return db.pdbs[i].Close()
+		return db.pdbs[i].DB.Close()
 	})
 }
 
@@ -80,7 +104,7 @@ func (db *DB) ExecContext(ctx context.Context, query string, args ...interface{}
 // establishing a connection if necessary.
 func (db *DB) Ping() error {
 	return scatter(len(db.pdbs), func(i int) error {
-		return db.pdbs[i].Ping()
+		return db.pdbs[i].DB.Ping()
 	})
 }
 
@@ -88,7 +112,7 @@ func (db *DB) Ping() error {
 // alive, establishing a connection if necessary.
 func (db *DB) PingContext(ctx context.Context) error {
 	return scatter(len(db.pdbs), func(i int) error {
-		return db.pdbs[i].PingContext(ctx)
+		return db.pdbs[i].DB.PingContext(ctx)
 	})
 }
 
@@ -98,7 +122,7 @@ func (db *DB) Prepare(query string) (Stmt, error) {
 	stmts := make([]*sql.Stmt, len(db.pdbs))
 
 	err := scatter(len(db.pdbs), func(i int) (err error) {
-		stmts[i], err = db.pdbs[i].Prepare(query)
+		stmts[i], err = db.pdbs[i].DB.Prepare(query)
 		return err
 	})
 
@@ -118,7 +142,7 @@ func (db *DB) PrepareContext(ctx context.Context, query string) (Stmt, error) {
 	stmts := make([]*sql.Stmt, len(db.pdbs))
 
 	err := scatter(len(db.pdbs), func(i int) (err error) {
-		stmts[i], err = db.pdbs[i].PrepareContext(ctx, query)
+		stmts[i], err = db.pdbs[i].DB.PrepareContext(ctx, query)
 		return err
 	})
 
@@ -130,32 +154,32 @@ func (db *DB) PrepareContext(ctx context.Context, query string) (Stmt, error) {
 
 // Query executes a query that returns rows, typically a SELECT.
 // The args are for any placeholder parameters in the query.
-// Query uses a slave as the physical db.
+// Query uses a nextReadAccessDB as the physical db.
 func (db *DB) Query(query string, args ...interface{}) (*sql.Rows, error) {
-	return db.Slave().Query(query, args...)
+	return db.ReadAccessDB().Query(query, args...)
 }
 
 // QueryContext executes a query that returns rows, typically a SELECT.
 // The args are for any placeholder parameters in the query.
-// QueryContext uses a slave as the physical db.
+// QueryContext uses a nextReadAccessDB as the physical db.
 func (db *DB) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
-	return db.Slave().QueryContext(ctx, query, args...)
+	return db.ReadAccessDB().QueryContext(ctx, query, args...)
 }
 
 // QueryRow executes a query that is expected to return at most one row.
 // QueryRow always return a non-nil value.
 // Errors are deferred until Row's Scan method is called.
-// QueryRow uses a slave as the physical db.
+// QueryRow uses a nextReadAccessDB as the physical db.
 func (db *DB) QueryRow(query string, args ...interface{}) *sql.Row {
-	return db.Slave().QueryRow(query, args...)
+	return db.ReadAccessDB().QueryRow(query, args...)
 }
 
 // QueryRowContext executes a query that is expected to return at most one row.
 // QueryRowContext always return a non-nil value.
 // Errors are deferred until Row's Scan method is called.
-// QueryRowContext uses a slave as the physical db.
+// QueryRowContext uses a nextReadAccessDB as the physical db.
 func (db *DB) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
-	return db.Slave().QueryRowContext(ctx, query, args...)
+	return db.ReadAccessDB().QueryRowContext(ctx, query, args...)
 }
 
 // SetMaxIdleConns sets the maximum number of connections in the idle
@@ -165,7 +189,7 @@ func (db *DB) QueryRowContext(ctx context.Context, query string, args ...interfa
 // If n <= 0, no idle connections are retained.
 func (db *DB) SetMaxIdleConns(n int) {
 	for i := range db.pdbs {
-		db.pdbs[i].SetMaxIdleConns(n)
+		db.pdbs[i].DB.SetMaxIdleConns(n)
 	}
 }
 
@@ -177,7 +201,7 @@ func (db *DB) SetMaxIdleConns(n int) {
 // of open connections. The default is 0 (unlimited).
 func (db *DB) SetMaxOpenConns(n int) {
 	for i := range db.pdbs {
-		db.pdbs[i].SetMaxOpenConns(n)
+		db.pdbs[i].DB.SetMaxOpenConns(n)
 	}
 }
 
@@ -186,23 +210,46 @@ func (db *DB) SetMaxOpenConns(n int) {
 // If d <= 0, connections are reused forever.
 func (db *DB) SetConnMaxLifetime(d time.Duration) {
 	for i := range db.pdbs {
-		db.pdbs[i].SetConnMaxLifetime(d)
+		db.pdbs[i].DB.SetConnMaxLifetime(d)
 	}
 }
 
-// Slave returns one of the physical databases which is a slave
-func (db *DB) Slave() *sql.DB {
-	return db.pdbs[db.slave(len(db.pdbs))]
+// ReadAccessDB returns one of the physical databases which is a nextReadAccessDB
+func (db *DB) ReadAccessDB() *sql.DB {
+	slaveIndex := db.nextReadAccessDB(len(db.pdbs))
+	hDB := db.pdbs[slaveIndex]
+	if hDB.IsHealthy() || !db.overallHealth.IsSet() {
+		return hDB.DB
+	}
+	return db.ReadAccessDB()
 }
 
 // Master returns the master physical database
 func (db *DB) Master() *sql.DB {
-	return db.pdbs[0]
+	return db.pdbs[0].DB
 }
 
-func (db *DB) slave(n int) int {
+func (db *DB) nextReadAccessDB(n int) int {
 	if n <= 1 {
 		return 0
 	}
-	return int(1 + (atomic.AddUint64(&db.count, 1) % uint64(n-1)))
+	return int(atomic.AddUint64(&db.count, 1) % uint64(n))
+}
+
+func (db *DB) CheckHealth() error {
+	allUnhealthy := true
+	for i, healthyDB := range db.pdbs {
+		if err := healthyDB.DB.Ping(); err != nil {
+			db.pdbs[i].SetUnhealthy()
+		} else {
+			db.pdbs[i].SetHealthy()
+			db.overallHealth.Set()
+			allUnhealthy = false
+		}
+	}
+	if allUnhealthy {
+		db.overallHealth.UnSet()
+		return errors.New("No mariadb's are available")
+	}
+	return nil
 }
