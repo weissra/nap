@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"github.com/labstack/gommon/log"
 	"github.com/tevino/abool"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -21,6 +24,7 @@ type DB struct {
 }
 
 type HealthyDB struct {
+	Name    string
 	DB      *sql.DB
 	healthy *abool.AtomicBool
 }
@@ -48,6 +52,11 @@ func Open(driverName, dataSourceNames string) (*DB, error) {
 		db.pdbs[i] = &HealthyDB{}
 		if db.pdbs[i].DB, err = sql.Open(driverName, conns[i]); err == nil {
 			db.pdbs[i].healthy = abool.NewBool(true)
+		}
+		if i == 0 {
+			db.pdbs[i].Name = "master"
+		} else {
+			db.pdbs[i].Name = "slave" + strconv.Itoa(i)
 		}
 		return err
 	})
@@ -236,10 +245,42 @@ func (db *DB) nextReadAccessDB(n int) int {
 	return int(atomic.AddUint64(&db.count, 1) % uint64(n))
 }
 
+func (db *DB) PrintStatus() {
+	for i := range db.pdbs {
+		log.Info(db.pdbs[i].Name , " is ready: ",db.pdbs[i].IsHealthy())
+	}
+}
+
+func (db *DB) CheckHealthCtx(ctx context.Context) error {
+	wg := sync.WaitGroup{}
+	wg.Add(len(db.pdbs))
+	allUnhealthy := abool.NewBool(true)
+	for i := range db.pdbs {
+		go func(hdb *HealthyDB) {
+			defer wg.Done()
+			if err := hdb.DB.PingContext(ctx); err != nil {
+				log.Error(hdb.Name, ":  ", err)
+				hdb.SetUnhealthy()
+			} else {
+				hdb.SetHealthy()
+				db.overallHealth.Set()
+				allUnhealthy.SetToIf(true, false)
+			}
+		}(db.pdbs[i])
+	}
+	wg.Wait()
+	if allUnhealthy.IsSet() {
+		db.overallHealth.UnSet()
+		return errors.New("No mariadb's are available")
+	}
+	return nil
+}
+
 func (db *DB) CheckHealth() error {
 	allUnhealthy := true
 	for i, healthyDB := range db.pdbs {
 		if err := healthyDB.DB.Ping(); err != nil {
+			log.Error(err)
 			db.pdbs[i].SetUnhealthy()
 		} else {
 			db.pdbs[i].SetHealthy()
