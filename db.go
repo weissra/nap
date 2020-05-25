@@ -233,6 +233,20 @@ func (db *DB) ReadAccessDB() *sql.DB {
 	return db.ReadAccessDB()
 }
 
+// Retrieves slice
+func (db *DB) Slaves() []*sql.DB {
+	if len(db.pdbs) < 2 {
+		return nil
+
+	}
+	var dbs []*sql.DB
+	for i := 1; i < len(db.pdbs); i++ {
+		dbs = append(dbs, db.pdbs[i].DB)
+	}
+
+	return dbs
+}
+
 // Master returns the master physical database
 func (db *DB) Master() *sql.DB {
 	return db.pdbs[0].DB
@@ -247,7 +261,7 @@ func (db *DB) nextReadAccessDB(n int) int {
 
 func (db *DB) PrintStatus() {
 	for i := range db.pdbs {
-		log.Info(db.pdbs[i].Name , " is ready: ",db.pdbs[i].IsHealthy())
+		log.Info(db.pdbs[i].Name, " is ready: ", db.pdbs[i].IsHealthy())
 	}
 }
 
